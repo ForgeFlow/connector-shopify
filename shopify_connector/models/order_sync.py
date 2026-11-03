@@ -11,6 +11,7 @@ from odoo import api, fields, models
 from odoo.exceptions import UserError
 from odoo.fields import Command
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
+from odoo.tools import float_compare
 
 from odoo.addons.queue_job.exception import RetryableJobError
 
@@ -1079,6 +1080,20 @@ class ShopifyOrderSync(models.Model):
             sale_order.picking_ids.filtered(lambda picking: picking.state == "done")
         )
 
+    def _ready_to_invoice(self, sale_order):
+        waiting = sale_order.order_line.filtered(
+            lambda line: (
+                line.product_id.invoice_policy == "delivery"
+                and float_compare(
+                    line.qty_delivered,
+                    line.product_uom_qty,
+                    precision_rounding=line.product_uom.rounding,
+                )
+                < 0
+            )
+        )
+        return not waiting and bool(sale_order._get_invoiceable_lines())
+
     def _apply_invoice_and_payments(self, binding, order_data):
         instance = binding.instance_id
         sale_order = binding.odoo_id
@@ -1098,7 +1113,7 @@ class ShopifyOrderSync(models.Model):
         invoices = sale_order.invoice_ids.filtered(
             lambda move: move.move_type == "out_invoice" and move.state != "cancel"
         )
-        if not invoices:
+        if not invoices and self._ready_to_invoice(sale_order):
             invoices = sale_order._create_invoices()
         for invoice in invoices.filtered(lambda move: move.state == "draft"):
             invoice.action_post()
@@ -1667,6 +1682,38 @@ class ShopifyWebhookOrderSync(models.Model):
                 f"{self.webhook_id}"
             ),
         )._job_import_draft_from_api(self.instance_id.id, draft_id)
+
+
+class StockPickingShopifyInvoicing(models.Model):
+    _inherit = "stock.picking"
+
+    def _action_done(self, *args, **kwargs):
+        result = super()._action_done(*args, **kwargs)
+        delivered = self.filtered(
+            lambda picking: (
+                picking.state == "done" and picking.picking_type_id.code == "outgoing"
+            )
+        )
+        bindings = delivered.sale_id.sudo().shopify_binding_ids.filtered(
+            lambda binding: (
+                not binding.is_draft
+                and binding.state == "synced"
+                and binding.instance_id.order_invoicing_policy != "manual"
+                and binding.odoo_id.invoice_status == "to invoice"
+            )
+        )
+        for binding in bindings:
+            binding.state = "pending"
+            binding.with_delay(
+                description=self.env._(
+                    "Invoice Shopify order %s after delivery", binding.order_name
+                ),
+                identity_key=(
+                    f"shopify.order.invoice.{binding.instance_id.id}."
+                    f"{binding.shopify_id}"
+                ),
+            )._job_import_order_from_api(binding.instance_id.id, binding.shopify_id)
+        return result
 
 
 WEBHOOK_HANDLERS.update(

@@ -478,6 +478,34 @@ class TestShopifyOrderSync(AccountTestInvoicingCommon):
         self.assertEqual(refund.move_id.move_type, "out_refund")
         self.assertEqual(refund.move_id.state, "posted")
 
+    def test_invoice_on_fulfillment_waits_for_the_odoo_delivery(self):
+        self.product.write({"type": "consu", "invoice_policy": "delivery"})
+        self.instance.write(
+            {
+                "order_confirmation_policy": "auto",
+                "order_invoicing_policy": "fulfillment",
+            }
+        )
+        payload = self._payload(
+            order_id=15,
+            displayFinancialStatus="PAID",
+            displayFulfillmentStatus="FULFILLED",
+        )
+        self.order_model._job_import_order(self.instance.id, payload)
+        binding = self.order_model.search(
+            [("shopify_id", "=", "gid://shopify/Order/15")]
+        )
+        self.assertEqual(binding.state, "synced", binding.error_message)
+        self.assertFalse(binding.odoo_id.invoice_ids)
+
+        picking = binding.odoo_id.picking_ids
+        picking.move_ids.write({"quantity": 1, "picked": True})
+        picking.button_validate()
+        self.assertEqual(binding.state, "pending")
+        self.order_model._job_import_order(self.instance.id, payload)
+
+        self.assertEqual(binding.odoo_id.invoice_ids.state, "posted")
+
     def test_draft_orders_are_skipped_when_the_scope_is_missing(self):
         client = Mock()
         client.execute.side_effect = ShopifyAccessDenied(
